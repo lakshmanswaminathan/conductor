@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Run the local Codex inbox MCP from any client working directory."""
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from conductor.codex_inbox import main
+
+main()
