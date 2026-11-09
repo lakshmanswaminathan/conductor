@@ -4,6 +4,7 @@ import hashlib
 
 from .swarm import SwarmBroker
 from .swarm_mcp import TOOL_DEFINITIONS
+from .swarm_notifications import FIELDS, send
 
 
 def swarm_tools():
@@ -16,7 +17,7 @@ def codex_tools():
     from .codex_inbox import TOOLS
     return [{'type': 'function', 'function': {'name': item['name'], 'description': item['description'],
              'parameters': ({**item['inputSchema'], 'properties': {**item['inputSchema']['properties'],
-                 'message': {'type': 'string', 'maxLength': 3500}}} if item['name'] == 'codex_send' else item['inputSchema'])}} for item in TOOLS]
+                 'message': {'type': 'string', 'maxLength': 3500}, **FIELDS}} if item['name'] == 'codex_send' else item['inputSchema'])}} for item in TOOLS]
 
 
 def perform(store, args, name):
@@ -37,6 +38,7 @@ def perform(store, args, name):
             if len(prefix + message) > 4000:
                 raise ValueError('Attributed Codex message exceeds 4000 characters')
             args = {**args, 'message': prefix + message}
+            return send(store, config['swarm_root'], actor, args, call)
         return call(config['swarm_root'], actor, name, args)
     if not config.get('computer_access') or not config.get('swarm_root'):
         raise RuntimeError('Swarm access is disabled or unavailable')

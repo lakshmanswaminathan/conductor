@@ -474,7 +474,8 @@ def run_codex_coordinator(store, key, binary=None):
             server.close()
         if scheduler:
             for agent in managed_agents(store):
-                if agent['state'] in {'pending', 'starting', 'running'}:
+                if (agent['state'] in {'pending', 'starting', 'running'} and
+                        assignment(store, agent['id']).get('kind') != 'pi'):
                     store.update_agent(agent['id'], state='interrupted', result='Native coordinator stopped; inspect work before retrying')
             for process in scheduler.processes:
                 if process.poll() is None:

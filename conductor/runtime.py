@@ -104,10 +104,41 @@ PI_ONLY_TOOLS = frozenset({'send', 'history', 'inspect_agent', 'search_context',
     'swarm_publish', 'swarm_events'})
 
 
+COORDINATION_PROTOCOL = """
+Conductor owns Pi dispatch, dependencies, steering, and result collection. Codex supplies
+upstream goals and reviews handoffs; do not offload routine swarm management to Codex.
+Use dispatch_pi.supersedes for a corrective assignment only after the previous Pi task has
+reported a terminal state and its local review is unsuccessful, or was never delivered
+because a dependency failed. Never replace uncertain work.
+Follow-up user messages continue existing assignments; inspect and reconcile them before
+new dispatch. Only explicit owner task completion submits a result for review. Published
+findings, an idle terminal, or a queued delivery are not completion. Accept with review_task
+only after inspecting evidence; dependencies release after acceptance.
+Use wait(after_cursor=...) for up to 60 seconds between meaningful changes. A timeout
+means keep waiting, not repeat context reads or ask workers for the same checkpoint.
+Read Pi context when a new milestone, blocker, missing evidence, or user question needs it.
+Steer once per concrete scope change or missed agreed checkpoint; inspect the existing
+receipt and trace before another nudge. Do not repeat unchanged progress in the chat.
+Monitor context pressure for your assigned Pi sessions using pi_agents context. When
+context_usage.percent reaches about 80%, or the agent reports context pressure, request
+pi_agents action=compact once for that exact observed session/instance. Pi owns native
+compaction; never send /compact as a user prompt or replace the worker's history with your
+own summary. Its compaction_control reports queued/running/completed/failed; accepted
+means queued, not compacted. Let tools and pending user messages finish first. Preserve
+task contracts and evidence in durable swarm state before a long handoff, and avoid a
+second request while compaction is queued/running or during its cooldown. Read context
+again only to verify the resulting native checkpoint or investigate a reported failure.
+For upstream progress use codex_send with notification_kind=progress, task_key, checkpoint,
+and progress_cursor from wait/status. Send only a changed milestone. Use failure,
+escalation, or final for those distinct events. Reuse semantic checkpoint identities and
+request IDs on retry; delivery queued is not Codex acceptance. Do not poll codex_status
+repeatedly: it is only a transport receipt, not an acknowledgment or a review verdict.
+"""
+
 def coordinator_instructions(config):
     if config.get('execution_policy') == 'pi_only':
-        return PI_ONLY_COORDINATOR
-    return COORDINATOR + (FILESYSTEM_MODE if config.get('scope') == 'filesystem' else REPOSITORY_MODE)
+        return PI_ONLY_COORDINATOR + COORDINATION_PROTOCOL
+    return COORDINATOR + COORDINATION_PROTOCOL + (FILESYSTEM_MODE if config.get('scope') == 'filesystem' else REPOSITORY_MODE)
 
 
 REPOSITORY_MODE = '''Dependent coding workers inherit predecessor patches; independent patches are NOT automatically
@@ -155,11 +186,11 @@ MANAGER_TOOLS = [
     tool('dispatch_pi', 'Assign and start managed work in an exact Pi instance. Queues behind busy work; reports require review.',
          {'id': STR, 'task': STR, 'session_id': STR, 'instance_id': STR,
           'dependencies': {'type': 'array', 'items': STR}, 'ownership': {'type': 'array', 'items': STR},
-          'acceptance': {'type': 'array', 'items': STR}}, ['id', 'task', 'session_id', 'instance_id', 'ownership', 'acceptance']),
+          'acceptance': {'type': 'array', 'items': STR}, 'supersedes': STR}, ['id', 'task', 'session_id', 'instance_id', 'ownership', 'acceptance']),
     tool('review_task', 'Accept or reject submitted work after inspecting evidence. Runs the assignment verification command if present.',
          {'agent': STR, 'accepted': {'type': 'boolean'}, 'summary': STR, 'evidence': {'type': 'array', 'items': STR}},
          ['agent', 'accepted', 'summary', 'evidence']),
-    tool('wait', 'Wait up to 10 seconds for workers; returns durable task state.', {}),
+    tool('wait', 'Wait up to 60 seconds for task results, peer messages/findings, or user input. Reuse returned cursor; timeout needs another wait, not repeated trace reads or steering.', {'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 60}, 'after_cursor': STR}),
     tool('status', 'Inspect worker progress, result summaries and unresolved conflicts.', {})]
 EXEC_TOOL = tool('exec', 'Run a shell command in your working directory. This is unsandboxed; stay within assigned scope. Output is archived.',
                  {'command': STR, 'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 120}}, ['command'])
@@ -470,17 +501,11 @@ class AgentLoop:
             from .orchestration import review
             return review(self, args)
         if name in {'wait', 'status'}:
-            self.scheduler.tick()
+            from .coordination_wait import progress, wait_for_progress
             if name == 'wait':
-                before = [(a['id'], a['state']) for a in self.store.agents()]
-                for _ in range(20):
-                    if self.store.config().get('cancel_requested'):
-                        break
-                    time.sleep(0.5)
-                    self.scheduler.tick()
-                    if [(a['id'], a['state']) for a in self.store.agents()] != before:
-                        break
-            return {'agents': self.store.agents(), 'findings': self.store.claims()}
+                return wait_for_progress(self.store, self.scheduler, args)
+            self.scheduler.tick()
+            return progress(self.store)
         raise ValueError('Unknown tool')
 
     def file_path(self, path):
@@ -593,7 +618,8 @@ def run_coordinator(store, provider):
                     AgentLoop(store, provider, 'coordinator', scheduler).run()
                 finally:
                     for agent in store.agents():
-                        if agent['parent'] and agent['state'] in {'starting', 'running'}:
+                        if (agent['parent'] and agent['state'] in {'starting', 'running'} and
+                                store.config().get('assignment:' + agent['id'], {}).get('kind') != 'pi'):
                             store.update_agent(agent['id'], state='interrupted', result='Coordinator stopped; inspect worktree and transcript before recovery')
                     for process in scheduler.processes:
                         if process.poll() is None:

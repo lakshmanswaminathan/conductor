@@ -9,7 +9,7 @@ from conductor.models import DEFAULT_MODEL
 from conductor.pi_monitor import pi_tools
 from conductor.provider import OpenRouter, schema_diagnostic
 from conductor.runtime import COMMON_TOOLS, MANAGER_TOOLS
-from conductor.swarm_runtime import swarm_tools
+from conductor.swarm_runtime import swarm_tools, codex_tools
 
 
 class ProviderSchemaTest(unittest.TestCase):
@@ -23,7 +23,7 @@ class ProviderSchemaTest(unittest.TestCase):
             elif isinstance(value, list):
                 for index, child in enumerate(value):
                     check(child, f'{path}[{index}]')
-        for tool in COMMON_TOOLS + MANAGER_TOOLS + computer_tools() + pi_tools() + swarm_tools():
+        for tool in COMMON_TOOLS + MANAGER_TOOLS + computer_tools() + pi_tools() + swarm_tools() + codex_tools():
             check(tool['function']['parameters'], tool['function']['name'])
 
     def test_schema_400_exposes_only_safe_diagnostic_and_does_not_retry(self):

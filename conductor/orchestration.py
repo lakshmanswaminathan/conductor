@@ -5,6 +5,11 @@ import time
 
 
 def begin_scope(store):
+    config = store.config()
+    unresolved = [a for a in store.agents() if a['parent'] and a['state'] != 'done'
+                  and not config.get('assignment:' + a['id'], {}).get('superseded_by')]
+    if unresolved and config.get('orchestration_scope') is not None:
+        return config['orchestration_scope']
     users = store.user_context()
     scope = users[-1]['id'] if users else 0
     store.configure(orchestration_scope=scope)
@@ -19,7 +24,8 @@ def managed_agents(store):
     config = store.config()
     scope = config.get('orchestration_scope')
     return [a for a in store.agents() if a['parent'] and
-            (scope is None or config.get('assignment:' + a['id'], {}).get('scope') == scope) and
+            (scope is None or config.get('assignment:' + a['id'], {}).get('scope') == scope
+             or a['state'] != 'done') and
             not config.get('assignment:' + a['id'], {}).get('superseded_by')]
 
 
