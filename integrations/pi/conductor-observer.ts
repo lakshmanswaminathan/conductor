@@ -44,6 +44,46 @@ export default function conductorObserver(pi) {
   let control, instanceId, socketName, sessionId, closed = true;
   const clients = new Set(), requests = new Map();
   const maxBytes = 40960;
+  let compaction = null, compactTimer;
+  const compactInstructions = 'Preserve the current task and user constraints, exact paths and identifiers, verified evidence and unresolved checks, ownership boundaries, and pending handoffs/dependencies. Distinguish reported results from accepted results. Retain actionable next steps. Use native session context; do not expose private reasoning.';
+  const compactBusy = () => ['queued', 'running'].includes(compaction?.state);
+  function saveCompaction() {
+    const file = join(directory, `${sessionId}.compaction.json`), temporary = `${file}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temporary, JSON.stringify(compaction), {mode: 0o600});
+      renameSync(temporary, file);
+      return true;
+    } catch {
+      // Keep the last durable intent intact. Never let observer storage failure
+      // escape into Pi or authorize retry of an uncertain native operation.
+      compaction = {...compaction, state: 'failed', persistence_error: true,
+        error: 'Compaction state could not be persisted; inspect the original session before retrying'};
+      try { unlinkSync(temporary); } catch {}
+      return false;
+    }
+  }
+  function finishCompaction(state) {
+    compaction = {...compaction, state, finished_at: Date.now()/1000,
+      ...(state === 'completed' ? {result_leaf_id: context.sessionManager.getLeafId()} : {error: 'Native compaction failed or attachment stopped; inspect session before retrying'})};
+    saveCompaction();
+    if (context) publish(context);
+  }
+  function advanceCompaction() {
+    clearImmediate(compactTimer);
+    // Never invoke native compact (which aborts a run) inside settled handlers.
+    compactTimer = setImmediate(() => {
+      if (closed || compaction?.state !== 'queued' || context?.sessionManager.getSessionId() !== sessionId || !context?.isIdle() || context.hasPendingMessages() || tools.size || reloadDispatched) return;
+      compaction = {...compaction, state: 'running', started_at: Date.now()/1000, leaf_id: context.sessionManager.getLeafId()};
+      if (!saveCompaction()) { publish(context); return; }
+      publish(context);
+      const expected = instanceId;
+      try {
+        context.compact({customInstructions: compactInstructions,
+          onComplete: () => { if (!closed && instanceId === expected && context.sessionManager.getSessionId() === sessionId) finishCompaction('completed'); },
+          onError: () => { if (!closed && instanceId === expected && context.sessionManager.getSessionId() === sessionId) finishCompaction('failed'); }});
+      } catch { finishCompaction('failed'); }
+    });
+  }
   let installedSourceHashes = loadedSourceHashes, updateState = 'current', reloadDispatched = false;
   const reloadCommand = 'conductor-reload-runtime';
   function inspectUpdate() {
@@ -61,7 +101,7 @@ export default function conductorObserver(pi) {
   }
   function checkUpdate(ctx) {
     inspectUpdate();
-    if (closed || reloadDispatched || updateState !== 'waiting_for_idle' || !ctx?.isIdle() || ctx.hasPendingMessages()) return;
+    if (compactBusy() || tools.size || closed || reloadDispatched || updateState !== 'waiting_for_idle' || !ctx?.isIdle() || ctx.hasPendingMessages()) return;
     reloadDispatched = true; updateState = 'reload_requested';
     try {
       // Registered command dispatch never becomes a model prompt. Pi defers it until
@@ -72,7 +112,7 @@ export default function conductorObserver(pi) {
   pi.registerCommand?.(reloadCommand, {
     description: 'Apply installed Conductor updates when this session is idle',
     handler: async (_args, ctx) => {
-      if (closed || !ctx.isIdle() || ctx.hasPendingMessages()) {
+      if (compactBusy() || tools.size || closed || !ctx.isIdle() || ctx.hasPendingMessages()) {
         reloadDispatched = false; updateState = 'waiting_for_idle'; return;
       }
       if (inspectUpdate() === 'current' || updateState === 'installing' || updateState === 'unavailable') return;
@@ -91,16 +131,27 @@ export default function conductorObserver(pi) {
       return reject('Session attachment is closed or changed');
     if (command.session_id !== sessionId || command.instance_id !== instanceId) return reject('Session or instance does not match');
     if (typeof command.request_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(command.request_id)) return reject('Invalid request_id');
-    if (!['steer', 'follow_up', 'ping'].includes(command.action)) return reject('Unsupported action');
-    if (command.action !== 'ping' && (typeof command.message !== 'string' || !command.message.trim())) return reject('A nonempty message is required');
+    if (!['steer', 'follow_up', 'ping', 'compact'].includes(command.action)) return reject('Unsupported action');
+    if (['steer', 'follow_up'].includes(command.action) && (typeof command.message !== 'string' || !command.message.trim())) return reject('A nonempty message is required');
     const hash = createHash('sha256').update(JSON.stringify([command.session_id, command.instance_id, command.action, command.message ?? null])).digest('hex');
     const prior = requests.get(command.request_id);
-    if (prior) return prior.hash === hash ? prior.result : reject('request_id was already used with a different payload');
+    if (prior) return prior.hash === hash ? {...prior.result, ...(command.action === 'compact' && compaction?.request_id === command.request_id ? {compaction} : {})} : reject('request_id was already used with a different payload');
     if (requests.size >= 4096) return reject('Attachment request capacity reached; reload the attachment');
     let result;
-    if (command.action === 'ping') {
-      result = { ...reply(command, 'accepted', 'status'), idle: context.isIdle(), pending_messages: context.hasPendingMessages() };
+    if (command.action === 'compact') {
+      if (typeof context.compact !== 'function') return reject('Native compaction API unavailable');
+      if (compaction?.persistence_error) return reject('Compaction persistence failed; inspect the original session before retrying');
+      if (compactBusy() || reloadDispatched) return reject('Compaction or runtime reload already pending');
+      const leaf = context.sessionManager.getLeafId();
+      if (compaction && (leaf === compaction.leaf_id || leaf === compaction.result_leaf_id || Date.now()/1000 - compaction.requested_at < 300)) return reject('Compaction already attempted on this leaf or within the five-minute cooldown');
+      compaction = {request_id: command.request_id, instance_id: instanceId, state: 'queued', leaf_id: leaf, requested_at: Date.now()/1000};
+      if (!saveCompaction()) { publish(context); return reject('Compaction intent could not be persisted; no compaction started'); }
+      publish(context); advanceCompaction();
+      result = {...reply(command, 'accepted', 'queued'), compaction};
+    } else if (command.action === 'ping') {
+      result = { ...reply(command, 'accepted', 'status'), idle: context.isIdle(), pending_messages: context.hasPendingMessages(), compaction };
     } else {
+      if (compaction?.state === 'running') return reject('Native compaction is running; retry after its terminal result');
       const idle = context.isIdle();
       const delivery = idle ? 'prompt' : command.action === 'steer' ? 'steering' : 'follow_up';
       try {
@@ -115,6 +166,8 @@ export default function conductorObserver(pi) {
   }
   async function stopControl() {
     closed = true;
+    if (compactBusy()) finishCompaction('failed');
+    clearImmediate(compactTimer);
     for (const client of clients) client.destroy();
     clients.clear();
     const server = control, oldSocket = socketName;
@@ -129,6 +182,10 @@ export default function conductorObserver(pi) {
     if (!info.isDirectory() || info.isSymbolicLink() || (process.getuid && info.uid !== process.getuid())) throw new Error('Unsafe observer directory');
     chmodSync(directory, 0o700);
     instanceId = randomUUID(); sessionId = ctx.sessionManager.getSessionId(); requests.clear();
+    try {
+      compaction = JSON.parse(readFileSync(join(directory, `${sessionId}.compaction.json`), 'utf8'));
+      if (compactBusy()) finishCompaction('failed');
+    } catch { compaction = null; }
     const expectedInstance = instanceId;
     socketName = `c-${process.pid}-${instanceId.slice(0, 12)}.sock`;
     const server = createServer(client => {
@@ -198,6 +255,7 @@ export default function conductorObserver(pi) {
       const snapshot = {
         version: 1, control_protocol: 'conductor.pi.control', control_version: 1, instance_id: instanceId,
         control_socket: !closed ? socketName : null, session_id: sessionId, pid: process.pid, observed_at: Date.now() / 1000,
+        compaction,
         extension_runtime: { loaded_hashes: loadedSourceHashes, installed_hashes: installedSourceHashes,
           update_state: updateState, hash_source: 'extension files at runtime initialization' },
         leaf_id: ctx.sessionManager.getLeafId(),
@@ -206,7 +264,7 @@ export default function conductorObserver(pi) {
         parent_pid: process.ppid, process_started_at: processStartedAt,
         recent_entries: recentEntries, recent_entries_truncated: recentEntries.length < entries.length || recentEntries.some(entry => entry.truncated === true),
         parent_session_file: publicValue(ctx.sessionManager.getHeader?.()?.parentSession ?? null),
-        status: status || (ctx.isIdle() ? 'idle' : 'working'),
+        status: status || (compaction?.state === 'running' ? 'working' : ctx.isIdle() ? 'idle' : 'working'),
         pending_messages: ctx.hasPendingMessages(), last_event: lastEvent,
         context_usage: publicValue(ctx.getContextUsage()),
         active_tools: [...tools.values()],
@@ -234,7 +292,7 @@ export default function conductorObserver(pi) {
     clearInterval(timer); await stopControl(); lastEvent = 'session_shutdown'; publish(ctx, 'closed'); context = undefined;
   });
   for (const name of ['agent_start', 'agent_settled', 'turn_end', 'message_end', 'session_tree', 'session_compact', 'model_select']) {
-    pi.on(name, (_event, ctx) => { context = ctx; lastEvent = name; if (name === 'agent_settled') checkUpdate(ctx); publish(ctx); });
+    pi.on(name, (_event, ctx) => { context = ctx; lastEvent = name; if (name === 'agent_settled') { advanceCompaction(); checkUpdate(ctx); } publish(ctx); });
   }
   pi.on('tool_execution_start', (event, ctx) => {
     tools.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, started_at: Date.now() / 1000 });

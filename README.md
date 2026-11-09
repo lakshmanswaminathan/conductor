@@ -55,6 +55,63 @@ Codex relay and `conductor_reply` remain available for older relay requests.
 If newly registered MCP tools are not loaded in the current Codex turn, the same
 script supports `--call TOOL` with JSON arguments on stdin.
 
+### Durable swarm coordination
+
+Conductor owns dispatch, dependencies, steering, and collection; Codex sends goals
+and reviews the handoff. Follow-up messages preserve unresolved assignments instead
+of creating a new task scope. Legacy assignments hidden by an old scope remain
+visible until accepted or explicitly superseded. A failed manager does not stop
+independent Pi processes: restarting reconciles the original task and owner without
+resending accepted or uncertain deliveries.
+
+Pi owners must update their exact `swarm_task` to `completed` with a nonempty result
+and verification references. Findings and chat replies alone do not release a task.
+Conductor reconciles that submission into `review`, then uses `review_task` to accept
+or reject it. Only acceptance releases dependent tasks. A corrective `dispatch_pi`
+can specify `supersedes` after the prior Pi task has a terminal report and its local
+assignment is unsuccessful (or it was never sent because a dependency failed); live
+or uncertain work cannot be silently replaced.
+
+`status` and `wait` return a progress cursor. `wait` defaults to 60 seconds and wakes
+on relevant task results, peer messages/findings, user input, or cancellation.
+The harness checks durable state while waiting, without another model call; observer
+heartbeats and repeated trace reads do not wake it. Reuse `after_cursor` to catch
+changes between calls. A timeout is not a reason to repeat steering or send a status
+message. Existing explicit API and turn ceilings still apply.
+
+Manager `codex_send` accepts `notification_kind` (`progress`, `failure`,
+`escalation`, or `final`), `task_key`, `checkpoint`, and `progress_cursor`. Progress
+requires a task key and checkpoint. Exact repeats and retries of the same checkpoint
+are deduplicated durably; changed checkpoint content needs a new cursor/checkpoint.
+New failure, escalation, and final reports remain separate. A deduplicated receipt
+identifies the original request for `codex_status`; queued delivery is never upstream
+acceptance. Unknown sends are not replayed, while a confirmed pre-enqueue rate limit
+can retry the same request. Semantic rephrasings with new identities still require
+manager discipline; this is not a natural-language duplicate detector.
+
+Chat lists show the task rather than the Codex transport envelope, recover old
+truncated titles from original instructions, and show searchable latest-request
+previews. Original transcripts and explicitly chosen titles are preserved.
+
+### Pi native context compaction
+
+The coordinator watches context usage for its assigned sessions and can request
+`pi_agents` with `action: "compact"`, an observed `session_id` and `instance_id`,
+and a stable `request_id`. Its policy recommends this around 80% context usage or
+when the worker reports pressure. This uses Pi's native `ctx.compact` API, not a
+`/compact` chat message or a replacement summary authored by Conductor.
+
+Busy requests wait for an idle boundary with no tools or pending messages. Urgent
+steering can still arrive while compaction is queued. Preservation instructions
+cover task constraints, paths, evidence, ownership, and pending handoffs. The public
+`compaction_control` records queued/running/completed/failed; a delivery receipt
+alone does not prove compaction completed. A five-minute cooldown and leaf checks
+prevent immediate repeats. Interrupted requests are not silently replayed after an
+observer reload. Pi runtimes without the native API reject the request explicitly.
+Install the updated observer using the existing installer; automatic reload waits
+for a safe idle point. Updating this repository alone does not update a live Pi
+runtime or compact any existing session.
+
 ### Execution ownership
 
 Only **data generation** must route through Conductor. Platform operations

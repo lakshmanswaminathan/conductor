@@ -61,6 +61,21 @@ class PiControlTest(unittest.TestCase):
         self.assertEqual(mismatch['status'], 'rejected')
         self.assertEqual(len(self.commands), 1)
 
+    def test_native_compact_receipt_is_durable_and_observable_without_replay(self):
+        thread = self.respond()
+        with patch.object(self.monitor, 'bridges', return_value={'agent-a': self.bridge}):
+            result = self.monitor.command('agent-a', 'instance-a', 'compact-a', 'compact')
+        thread.join()
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(self.commands[0]['action'], 'compact')
+        self.assertNotIn('message', self.commands[0])
+        restarted = PiMonitor(bridge_root=self.root)
+        observed = {'request_id': 'compact-a', 'instance_id': 'instance-a', 'state': 'completed'}
+        with patch.object(restarted, 'records', return_value={'agent-a': {'compaction': observed}}), patch.object(restarted, 'bridges', side_effect=AssertionError('Must not replay')):
+            receipt = restarted.command('agent-a', 'instance-a', 'compact-a', 'compact')
+        self.assertEqual(receipt['compaction']['state'], 'completed')
+        self.assertEqual(len(self.commands), 1)
+
     def test_mismatched_ack_is_unknown_and_never_retargeted(self):
         thread = self.respond(mismatched=True)
         with patch.object(self.monitor, 'bridges', return_value={'agent-a': self.bridge}):

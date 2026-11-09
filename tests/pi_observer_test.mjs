@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, rmSync, statSync, existsSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, statSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -205,4 +205,110 @@ try {
 } finally {
   await runtimeHandlers.get('session_shutdown')?.({}, runtimeContext);
   rmSync(runtimeDirectory, {recursive: true, force: true});
+}
+
+// Native compaction never becomes a user message or runs across active work.
+const compactDirectory = mkdtempSync('/tmp/co-compact-');
+process.env.CONDUCTOR_PI_OBSERVER_DIR = compactDirectory;
+const compactHandlers = new Map(), nativeCalls = [], compactMessages = [];
+let compactIdle = false, compactPending = false, compactLeaf = 'before', nativeNow = Date.now;
+const compactContext = {...ctx,
+  sessionManager: {...ctx.sessionManager, getLeafId: () => compactLeaf},
+  isIdle: () => compactIdle, hasPendingMessages: () => compactPending,
+  compact: options => nativeCalls.push(options),
+};
+const compactSnapshot = () => JSON.parse(readFileSync(join(compactDirectory, 'test-session.json')));
+const settle = async () => { compactHandlers.get('agent_settled')({}, compactContext); await new Promise(resolve => setImmediate(resolve)); };
+function compactSend(request_id, action = 'compact') {
+  const state = compactSnapshot();
+  return new Promise((resolve, reject) => {
+    const client = createConnection(join(compactDirectory, state.control_socket));
+    let output = '';
+    client.on('connect', () => client.write(JSON.stringify({session_id: state.session_id, instance_id: state.instance_id, request_id, action, ...(action === 'steer' ? {message:'Urgent clarification'} : {})}) + '\n'));
+    client.on('data', data => output += data);
+    client.on('error', reject);
+    client.on('end', () => resolve(JSON.parse(output)));
+  });
+}
+try {
+  extension({on: (name, handler) => compactHandlers.set(name, handler), sendUserMessage: (...args) => compactMessages.push(args)});
+  await compactHandlers.get('session_start')({}, compactContext);
+  assert.equal((await compactSend('compact-one')).compaction.state, 'queued');
+  assert.equal((await compactSend('compact-one')).status, 'accepted');
+  assert.equal(nativeCalls.length, 0);
+  assert.equal((await compactSend('urgent', 'steer')).status, 'accepted');
+  assert.equal(compactMessages.length, 1);
+  compactIdle = true; compactPending = true;
+  await settle(); assert.equal(nativeCalls.length, 0);
+  compactPending = false;
+  compactHandlers.get('tool_execution_start')({toolCallId:'active',toolName:'bash'}, compactContext);
+  await settle(); assert.equal(nativeCalls.length, 0);
+  compactHandlers.get('tool_execution_end')({toolCallId:'active'}, compactContext);
+  await settle(); assert.equal(nativeCalls.length, 1);
+  assert.equal(compactSnapshot().compaction.state, 'running');
+  assert.equal((await compactSend('during', 'steer')).status, 'rejected');
+  assert.match(nativeCalls[0].customInstructions, /ownership/);
+  assert.match(nativeCalls[0].customInstructions, /evidence/);
+  compactLeaf = 'after'; nativeCalls[0].onComplete({summary:'private summary is not published'});
+  assert.equal((await compactSend('compact-one')).compaction.state, 'completed');
+  assert(!JSON.stringify(compactSnapshot()).includes('private summary'));
+  assert.equal((await compactSend('repeat-leaf')).status, 'rejected');
+  compactLeaf = 'next';
+  assert.equal((await compactSend('cooldown')).status, 'rejected');
+  Date.now = () => nativeNow() + 301000;
+  assert.equal((await compactSend('compact-two')).status, 'accepted');
+  await new Promise(resolve => setImmediate(resolve));
+  nativeCalls[1].onError(new Error('private native exception'));
+  assert.equal(compactSnapshot().compaction.state, 'failed');
+  assert(!JSON.stringify(compactSnapshot()).includes('private native exception'));
+  assert.equal(compactMessages.length, 1); // Only the explicit urgent steering message.
+  compactLeaf = 'queued-before-shutdown'; compactIdle = false;
+  Date.now = () => nativeNow() + 602000;
+  assert.equal((await compactSend('compact-three')).compaction.state, 'queued');
+  await compactHandlers.get('session_shutdown')({}, compactContext);
+  assert.equal(compactSnapshot().compaction.state, 'failed');
+  assert.equal(nativeCalls.length, 2);
+  await compactHandlers.get('session_start')({}, compactContext);
+  assert.equal((await compactSend('same-leaf-after-reload')).status, 'rejected');
+  nativeCalls[0].onComplete({}); // Old callbacks cannot mutate a new attachment.
+  assert.equal(compactSnapshot().compaction.state, 'failed');
+  const journal = join(compactDirectory, 'test-session.compaction.json');
+  const journalTemporary = `${journal}.${process.pid}.tmp`;
+  compactLeaf = 'persistence-start'; Date.now = () => nativeNow() + 903000;
+  assert.equal((await compactSend('compact-four')).compaction.state, 'queued');
+  mkdirSync(journalTemporary); // Deterministic write failure without changing the durable intent.
+  compactIdle = true;
+  await settle();
+  assert.equal(nativeCalls.length, 2);
+  assert.equal(compactSnapshot().compaction.persistence_error, true);
+  assert.equal(JSON.parse(readFileSync(journal)).state, 'queued');
+  assert.equal((await compactSend('retry-persistence')).status, 'rejected');
+  rmSync(journalTemporary, {recursive:true});
+  await compactHandlers.get('session_shutdown')({}, compactContext);
+  await compactHandlers.get('session_start')({}, compactContext);
+  assert.equal(compactSnapshot().compaction.state, 'failed'); // Interrupted intent never replays.
+  compactLeaf = 'persistence-finish'; Date.now = () => nativeNow() + 1204000;
+  assert.equal((await compactSend('compact-five')).status, 'accepted');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(nativeCalls.length, 3);
+  mkdirSync(journalTemporary);
+  assert.doesNotThrow(() => nativeCalls[2].onComplete({}));
+  assert.equal(compactSnapshot().compaction.persistence_error, true);
+  assert.equal(JSON.parse(readFileSync(journal)).state, 'running');
+  rmSync(journalTemporary, {recursive:true});
+  await compactHandlers.get('session_shutdown')({}, compactContext);
+  await compactHandlers.get('session_start')({}, compactContext);
+  compactLeaf = 'persistence-intent'; Date.now = () => nativeNow() + 1505000;
+  mkdirSync(journalTemporary);
+  const unpersisted = await compactSend('compact-six');
+  assert.equal(unpersisted.status, 'rejected');
+  assert.match(unpersisted.error, /no compaction started/);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(nativeCalls.length, 3);
+  rmSync(journalTemporary, {recursive:true});
+  console.log('Pi native compaction deferral, evidence preservation, callbacks, cooldown and restart guards passed.');
+} finally {
+  Date.now = nativeNow;
+  await compactHandlers.get('session_shutdown')?.({}, compactContext);
+  rmSync(compactDirectory, {recursive:true, force:true});
 }

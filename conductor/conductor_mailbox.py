@@ -12,6 +12,7 @@ import time
 
 from . import codex_inbox
 from .store import Store
+from .conversation_labels import conversation_labels
 
 
 def _db(root):
@@ -203,7 +204,7 @@ def _chats(root):
         try:
             config, agent = store.config(), store.agent('coordinator')
             if agent:
-                result.append({'chat_id':path.parent.name, 'title':config.get('title', '')[:100],
+                result.append({'chat_id':path.parent.name, **conversation_labels(store, config, agent),
                                'state':agent['state'], 'model':config.get('model'),
                                'updated_at':store.db.execute('SELECT MAX(at) FROM events').fetchone()[0] or 0})
         finally:

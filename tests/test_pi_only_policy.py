@@ -46,6 +46,7 @@ class PiOnlyPolicyTests(unittest.TestCase):
 
     def test_codex_routes_to_inbox_with_stable_chat_actor(self):
         with patch('conductor.codex_inbox.call', return_value={'status': 'queued'}) as inbox, \
+             patch('conductor.codex_inbox.target', return_value=('target', '/mock/codex')), \
              patch('conductor.swarm_runtime.SwarmBroker') as broker:
             perform(self.store, {'message': 'Report', 'request_id': 'report-1'}, 'codex_send')
             first = inbox.call_args.args[1]

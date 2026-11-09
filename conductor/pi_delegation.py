@@ -35,10 +35,18 @@ def _live(assignment):
 def _receipt(store, ident):
     assignment = store.config()['assignment:' + ident]
     agent = store.agent(ident)
-    return {'id': ident, 'state': agent['state'], 'session_id': assignment['session_id'],
+    receipt = {'id': ident, 'state': agent['state'], 'session_id': assignment['session_id'],
             'instance_id': assignment['instance_id'], 'swarm_task_id': assignment['swarm_task_id'],
             'request_id': assignment['request_id'], 'delivery': assignment.get('delivery'),
             'review_required': True, 'result': agent.get('result')}
+    if assignment.get('supersedes'):
+        receipt['supersedes'] = assignment['supersedes']
+        receipt['dependent_recovery'] = {
+            'agents': [a['id'] for a in managed_agents(store)
+                       if assignment['supersedes'] in a['deps'] and a['state'] != 'done'],
+            'guidance': 'Dependencies are not rewritten automatically. Explicitly replace '
+                        'blocked, never-delivered dependents using supersedes and corrected dependencies.'}
+    return receipt
 
 
 def delegate(store, args):
@@ -63,6 +71,31 @@ def delegate(store, args):
             not isinstance(d, str) or d in {ident, 'coordinator'} or not store.agent(d) for d in dependencies):
         raise ValueError('Dependencies must name existing local worker tasks')
     spec['dependencies'] = list(dict.fromkeys(dependencies))
+    previous = args.get('supersedes')
+    if previous is not None:
+        old = store.agent(previous) if isinstance(previous, str) else None
+        old_spec = config.get('assignment:' + str(previous), {})
+        if (not old or old['state'] not in {'failed', 'blocked', 'interrupted'} or
+                old_spec.get('kind') != 'pi' or previous in dependencies or previous == ident or
+                old_spec.get('superseded_by') not in (None, ident)):
+            raise ValueError('supersedes must name an unsuccessful Pi assignment, not a dependency')
+        broker = SwarmBroker(config['swarm_root'], monitor)
+        try:
+            row = broker.db.execute('SELECT owner,status FROM tasks WHERE task_id=?',
+                                    (old_spec.get('swarm_task_id'),)).fetchone()
+            never_sent = (old_spec.get('phase') == 'prepared' and
+                          (not row or (row['owner'] == old_spec.get('session_id') and row['status'] == 'pending')))
+            reported_terminal = (row and row['owner'] == old_spec.get('session_id') and
+                                 row['status'] in {'completed', 'failed', 'blocked'})
+            if not (never_sent or reported_terminal):
+                raise ValueError('Original Pi task has no terminal report; reconcile it before replacement')
+        finally:
+            broker.close()
+        spec['supersedes'] = previous
+    prior = config.get('assignment:' + ident)
+    if prior:
+        # Follow-ups retain assignment identity even if older code changed scope.
+        spec['scope'] = prior.get('scope')
     fingerprint = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
     prior = config.get('assignment:' + ident)
     if prior:
@@ -71,7 +104,7 @@ def delegate(store, args):
     else:
         if store.agent(ident):
             raise ValueError('Task ID already exists')
-        if len(managed_agents(store)) >= config.get('max_tasks', 100):
+        if len(managed_agents(store)) - bool(previous) >= config.get('max_tasks', 100):
             raise ValueError('Run task ceiling reached')
         if not _live(spec):
             raise ValueError('Exact live Pi session and instance required')
@@ -83,6 +116,8 @@ def delegate(store, args):
         _save(store, ident, prior)
     if not store.agent(ident):
         store.add_agent(ident, 'coordinator', task, spec['dependencies'])
+    if previous:
+        _save(store, previous, config['assignment:' + previous] | {'superseded_by': ident})
     tick(store)
     return _receipt(store, ident)
 
@@ -95,14 +130,14 @@ def _advance(store, agent, assignment, broker):
         return
     if any(d['state'] != 'done' for d in dependencies):
         return
-    if not _live(assignment):
-        _block(store, ident, 'The assigned Pi observer is missing or its instance changed')
-        return
     phase = assignment.get('phase')
     if phase == 'sending':
         _block(store, ident, 'Delivery outcome is unknown after an interrupted attempt')
         return
     if phase == 'prepared':
+        if not _live(assignment):
+            _block(store, ident, 'The assigned Pi observer is missing or its instance changed')
+            return
         broker.call('conductor', 'swarm_task', {
             'action': 'create', 'task_id': assignment['swarm_task_id'],
             'title': agent['task'][:300], 'description': agent['task'],
@@ -113,6 +148,11 @@ def _advance(store, agent, assignment, broker):
                                'acceptance': assignment['acceptance']}, ensure_ascii=False) +
                    '\nUse swarm_task to claim this exact task, then update it to completed with '
                    'a result citing verification evidence, or blocked/failed with the reason. '
+                   'Completion must be an explicit swarm_task update: '
+                   + json.dumps({'action': 'update', 'task_id': assignment['swarm_task_id'],
+                                 'status': 'completed', 'result': '<verification evidence>',
+                                 'request_id': assignment['request_id'] + '-completed'}) + '. '
+                   'A chat reply or published finding alone does not complete the task. '
                    'Use stable request_id values for mutations. Stay within the assigned ownership. '
                    'Reported completion requires Conductor review; do not treat it as final acceptance.')
         if len(message) > 12000:
@@ -144,6 +184,12 @@ def _advance(store, agent, assignment, broker):
         _block(store, ident, 'Assigned swarm task is missing or its ownership changed')
         return
     status = row['status']
+    if status == 'completed' and (not isinstance(row['result'], str) or not row['result'].strip()):
+        _block(store, ident, 'Pi completion requires an explicit result citing verification evidence')
+        return
+    if status not in {'completed', 'failed', 'blocked'} and not _live(assignment):
+        _block(store, ident, 'The assigned Pi observer is missing or its instance changed')
+        return
     result = json.dumps(_clean({'session_id': assignment['session_id'],
                                'instance_id': assignment['instance_id'],
                                'swarm_task_id': assignment['swarm_task_id'],
@@ -153,13 +199,30 @@ def _advance(store, agent, assignment, broker):
                        result=result, heartbeat=time.time())
 
 
+def _reconcilable(agent, spec):
+    if agent['state'] in {'pending', 'running'}:
+        return True
+    if not spec or spec.get('phase') != 'accepted':
+        return False
+    if agent['state'] == 'interrupted':
+        return True
+    if agent['state'] == 'blocked':
+        try:
+            result = json.loads(agent.get('result') or '{}')
+        except (TypeError, ValueError):
+            return False
+        # Review rejection is a durable decision, not a transport interruption.
+        return isinstance(result, dict) and 'recovery' in result and 'error' in result
+    return False
+
+
 def tick(store):
     """Reconcile durable Pi assignments without terminal input or automatic replay."""
     config = store.config()
     if not config.get('computer_access') or not config.get('swarm_root') or config.get('cancel_requested'):
         return
     assignments = [(a, config.get('assignment:' + a['id'])) for a in managed_agents(store)
-                   if a['parent'] and a['state'] in {'pending', 'running'}]
+                   if a['parent'] and _reconcilable(a, config.get('assignment:' + a['id']))]
     assignments = [(a, s) for a, s in assignments if s and s.get('kind') == 'pi']
     if not assignments:
         return

@@ -356,7 +356,7 @@ class CodexRuntimeTests(unittest.TestCase):
         _, checkpoint = _coordination_input(records, checkpoint)
         self.assertGreater(len(checkpoint), seen)
 
-    def test_historic_failure_is_not_current_scope_failure(self):
+    def test_unresolved_historic_failure_cannot_disappear_on_followup(self):
         self.store.configure(ui=True)
         self.store.add_agent('old', 'coordinator', 'Historical task')
         self.store.update_agent('old', state='failed', result='HISTORIC_FAILURE')
@@ -365,9 +365,9 @@ class CodexRuntimeTests(unittest.TestCase):
         with patch('conductor.codex_runtime.Scheduler.tick'):
             server = self.run_native()
         self.assertEqual(self.store.config()['orchestration_scope'], event)
-        self.assertEqual(self.store.agent('coordinator')['state'], 'done')
+        self.assertEqual(self.store.agent('coordinator')['state'], 'blocked')
         prompt = next(p['input'][0]['text'] for m, p in server.requests if m == 'turn/start')
-        self.assertNotIn('HISTORIC_FAILURE', prompt)
+        self.assertIn('HISTORIC_FAILURE', prompt)
 
     def test_review_is_required_and_accepted_through_tool_before_final(self):
         self.store.configure(ui=True, max_turns=5)

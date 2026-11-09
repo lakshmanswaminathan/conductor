@@ -63,15 +63,31 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(self.store.agent('coordinator')['state'],'done')
         self.assertEqual(self.store.agent('failed')['state'],'failed')
 
-    def test_new_scope_does_not_launch_or_block_on_old_tasks(self):
+    def test_followup_retains_scope_and_review_unlocks_dependency(self):
+        original = self.store.config()['orchestration_scope']
+        self.dispatch('first')
+        self.dispatch('dependent', dependencies=['first'])
+        self.submit('first')
+        self.store.event('user', '*', 'instruction', 'Continue and verify the work')
+        self.assertEqual(begin_scope(self.store), original)
+        with patch.object(self.scheduler, 'tick') as tick:
+            self.manager.execute('review_task', {'agent': 'first', 'accepted': True,
+                'summary': 'Evidence verified', 'evidence': ['first.txt']})
+            tick.assert_called_once()
+        self.assertEqual(self.store.agent('first')['state'], 'done')
+        self.assertEqual({a['id'] for a in managed_agents(self.store)}, {'first', 'dependent'})
+        self.store.update_agent('dependent', state='done')
+        self.assertNotEqual(begin_scope(self.store), original)
+        self.assertEqual(managed_agents(self.store), [])
+
+    def test_legacy_mismatched_scope_remains_reviewable(self):
         self.dispatch('old')
-        self.store.event('user','*','instruction','A different task')
-        begin_scope(self.store)
-        with patch('conductor.runtime.subprocess.Popen') as spawn:
-            self.scheduler.tick()
-            spawn.assert_not_called()
-        self.assertEqual(managed_agents(self.store),[])
-        self.assertEqual(self.store.agent('old')['state'],'pending')
+        self.submit('old')
+        self.store.configure(orchestration_scope='legacy-followup')
+        self.assertEqual([a['id'] for a in managed_agents(self.store)], ['old'])
+        self.manager.execute('review_task', {'agent': 'old', 'accepted': True,
+            'summary': 'Verified original work', 'evidence': ['old.txt']})
+        self.assertEqual(self.store.agent('old')['state'], 'done')
 
     def test_desktop_delegation_requires_contract_and_manager_can_verify(self):
         with self.assertRaisesRegex(ValueError,'ownership'):

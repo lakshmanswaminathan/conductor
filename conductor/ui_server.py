@@ -23,6 +23,7 @@ from .provider import OpenRouter, validate_key
 from .store import Store
 from .models import DEFAULT_MODEL
 from .pi_sessions import _clean
+from .conversation_labels import conversation_labels, compact, request_text
 
 
 def _activity_label(name, args):
@@ -187,7 +188,7 @@ class App:
                 if not agent:
                     continue
                 updated = store.db.execute('SELECT MAX(at) FROM events').fetchone()[0] or file.stat().st_mtime
-                result.append({'id': file.parent.name, 'title': config.get('title', agent['task'])[:100],
+                result.append({'id': file.parent.name, **conversation_labels(store, config, agent),
                     'state': 'running' if self.is_running(file.parent.name) else agent['state'], 'updated_at': updated, 'model': config.get('model')})
             finally:
                 store.close()
@@ -247,7 +248,7 @@ class App:
                             'evidence':_clean(output.get('evidence',arguments[call_id].get('evidence',[]))), 'at':row['at']})
             messages.sort(key=lambda m: m['at'])
             agent = store.agent('coordinator')
-            return {'id': ident, 'title': config.get('title', agent['task'])[:100], 'state': agent['state'],
+            return {'id': ident, **conversation_labels(store, config, agent), 'state': agent['state'],
                 'running': running, 'stopping': ident in self.stopping, 'messages': messages,
                 'agents': [a for a in store.agents() if a['parent']], 'findings': store.claims(),
                 'checkpoints': {a['id']: store.checkpoint(a['id']) for a in store.agents()},
@@ -302,7 +303,7 @@ class App:
                 settings = self.settings | self.validate_settings(data)
                 store = initialize(self.root / ident, Path.home(), message, scope='filesystem', allow_exec=False,
                     execution_policy='pi_only', ui=True, context_budget=96000, native_executable=self.native,
-                    title=message[:100], first_request_id=request, **settings)
+                    title=compact(request_text(message), 100), first_request_id=request, **settings)
             else:
                 store = Store(self.path(ident))
             try:
