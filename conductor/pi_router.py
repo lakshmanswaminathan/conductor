@@ -21,6 +21,9 @@ def _db(root):
     db.execute('''CREATE TABLE IF NOT EXISTS routes(
         request_id TEXT PRIMARY KEY,fingerprint TEXT,session_id TEXT,instance_id TEXT,
         task_id TEXT,spec TEXT,delivery TEXT,review TEXT,created_at REAL)''')
+    db.execute("""CREATE TABLE IF NOT EXISTS controls(
+        control_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        delivery TEXT NOT NULL, created_at REAL NOT NULL)""")
     return db
 
 
@@ -75,8 +78,7 @@ def dispatch(root, args):
             if previous:
                 if previous['fingerprint'] != fingerprint:
                     raise ValueError('Request ID belongs to a different Pi assignment')
-                if json.loads(previous['delivery']).get('status') in {'accepted','rejected'}:
-                    return result(root, request)
+                return result(root, request)
             bridge = monitor.bridges().get(args['session_id'])
             if not bridge or bridge.get('instance_id') != args['instance_id'] or not monitor.control_path(bridge):
                 raise ValueError('Exact live Pi session/instance with control attachment required; no local fallback')
@@ -121,9 +123,59 @@ def result(root, request):
     return {'request_id':request,'session_id':item['session_id'],'instance_id':item['instance_id'],
             'task_id':item['task_id'],'operation':json.loads(item['spec'])['operation'],
             'delivery':json.loads(item['delivery']),'task':task,
+            'reconciliation':('Delivery is uncertain. Inspect the exact Pi instance and task before further action; this request will not be replayed.' if json.loads(item['delivery']).get('status') == 'unknown' else None),
             'review':reviewed,
             'complete':bool(reviewed and reviewed['accepted'] and task and task['status']=='completed'
                             and reviewed.get('reported_result') == task['result'])}
+
+
+def control(root, args):
+    """Steer the existing owner without creating or reassigning a task."""
+    _enabled(root)
+    if not isinstance(args, dict) or set(args) != {'request_id', 'control_id', 'action', 'message'}:
+        raise ValueError('Control requires request_id, control_id, action, and message')
+    for key in ('request_id', 'control_id'):
+        if not isinstance(args[key], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', args[key]):
+            raise ValueError('Invalid ' + key)
+    if args['action'] not in {'steer', 'follow_up'}:
+        raise ValueError('Control action must be steer or follow_up')
+    _text(args['message'], 'message', 4000)
+    fingerprint = hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()
+    db = _db(root)
+    try:
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            previous = db.execute('SELECT * FROM controls WHERE control_id=?', (args['control_id'],)).fetchone()
+            if previous:
+                if previous['fingerprint'] != fingerprint:
+                    raise ValueError('Control ID belongs to different content or assignment')
+                delivery = json.loads(previous['delivery'])
+            else:
+                current = result(root, args['request_id'])
+                if current['delivery'].get('status') != 'accepted':
+                    raise ValueError('Assignment delivery is not accepted; reconcile the exact owner before control')
+                task = current['task']
+                if not task or task['status'] in {'completed', 'blocked', 'failed'}:
+                    raise ValueError('No active owner assignment; terminal reports require review and a new assignment')
+                bridge = monitor.bridges().get(current['session_id'])
+                if not bridge or bridge.get('instance_id') != current['instance_id'] or not monitor.control_path(bridge):
+                    raise ValueError('Exact live Pi owner instance required; reconcile stale instance before control')
+                delivery = {'status': 'unknown'}
+                db.execute('INSERT INTO controls VALUES(?,?,?,?,?)',
+                           (args['control_id'], args['request_id'], fingerprint, json.dumps(delivery), time.time()))
+        if not previous:
+            command_id = 'codex-control-' + hashlib.sha256(args['control_id'].encode()).hexdigest()[:24]
+            payload = ('Existing assignment control; preserve the original ownership, acceptance criteria, '
+                       'scope and approvals. Do not create another task.\n' +
+                       json.dumps({'task_id': current['task_id'], 'message': args['message']}, ensure_ascii=False))
+            delivery = monitor.command(current['session_id'], current['instance_id'], command_id, args['action'], payload)
+            with db:
+                db.execute('UPDATE controls SET delivery=? WHERE control_id=?', (json.dumps(delivery), args['control_id']))
+        return {'request_id': args['request_id'], 'control_id': args['control_id'], 'delivery': delivery,
+                'reconciliation': ('Delivery is uncertain. Inspect the exact owner and task; this control will not be replayed.'
+                                   if delivery.get('status') == 'unknown' else None)}
+    finally:
+        db.close()
 
 
 def review(root, args):

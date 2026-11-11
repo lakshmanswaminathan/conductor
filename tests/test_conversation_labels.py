@@ -9,6 +9,19 @@ from conductor.ui_server import App
 
 
 class ConversationLabelsTest(unittest.TestCase):
+    def test_agent_feedback_chat_keeps_task_title_and_latest_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = initialize(root/'run', root, 'Placeholder')
+            store.db.execute("DELETE FROM events WHERE kind='instruction'")
+            store.db.commit()
+            store.add_feedback('Build a status monitor', 'goal')
+            store.add_feedback('Review its blocked-task display', 'review')
+            labels = conversation_labels(store, {}, store.agent('coordinator'))
+            self.assertEqual(labels, {'title': 'Build a status monitor', 'preview': 'Review its blocked-task display'})
+            self.assertEqual(store.user_context(), [])
+            store.close()
+
     def test_old_truncated_transport_title_is_recovered_on_all_read_surfaces(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

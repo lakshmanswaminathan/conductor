@@ -6,12 +6,14 @@ Pi executes operational work.** Conductor runs its own OpenRouter model and exch
 context with your existing Codex desktop chat. Python 3.11+, macOS 14+, an OpenRouter
 key, the Codex CLI/desktop, and Pi support the full desktop workflow.
 
-## Turn limits
+## Run limits
 
-New runs have no turn ceiling (`max_turns: 0`). CLI users can set a positive
-`--max-turns N` to impose a limit; `--max-turns 0` is unlimited. Existing runs
-retain their stored limit until explicitly changed. Cancellation, API-call
-budgets and runtime timeouts remain separate controls.
+New runs have no turn, provider-call, or worker-task ceiling (`0` means unlimited).
+CLI users can set positive `--max-turns`, `--max-calls`, and `--max-tasks` limits.
+Existing runs retain stored limits until explicitly changed. An optional
+`--max-spend` stops new requests after recorded OpenRouter spend reaches that USD
+threshold; it is postpaid, so the final call can exceed it. Omit it for unlimited
+spend; `--max-spend 0` blocks requests. Pi's own provider budget remains separate.
 
 ## Desktop app
 
@@ -46,7 +48,10 @@ Codex uses `conductor_send` with a stable `request_id`, a `message`, and optiona
 an existing `chat_id` to send goals or steering to Conductor. `conductor_status`
 lists recent chats; `conductor_result` reads delivery and reported results.
 The durable inbox waits for the app and model key, then wakes the same manager.
-HTTP retries do not duplicate user instructions. Results use the handled instruction
+Codex messages are agent feedback with their own durable cursor, not new human
+instructions. The original delegated goal stays pinned separately; resolved feedback
+can leave the working prompt via `resolve_feedback` with evidence while raw history
+remains searchable. HTTP retries do not duplicate feedback. Results use the handled instruction
 cursor so an older response cannot complete a newer request. Reports survive an
 offline bridge and uncertain external delivery is never blindly replayed.
 Closing Conductor stops its manager and inbox processing, while existing Pi and
@@ -72,12 +77,14 @@ can specify `supersedes` after the prior Pi task has a terminal report and its l
 assignment is unsuccessful (or it was never sent because a dependency failed); live
 or uncertain work cannot be silently replaced.
 
-`status` and `wait` return a progress cursor. `wait` defaults to 60 seconds and wakes
-on relevant task results, peer messages/findings, user input, or cancellation.
-The harness checks durable state while waiting, without another model call; observer
-heartbeats and repeated trace reads do not wake it. Reuse `after_cursor` to catch
-changes between calls. A timeout is not a reason to repeat steering or send a status
-message. Existing explicit API and turn ceilings still apply.
+`status` and `wait` return a progress cursor. `wait` suspends model inference until
+relevant task results, peer messages/findings, human input, agent feedback, or
+cancellation. The harness checks durable state in bounded chunks (60 seconds by
+default); chunk timeouts do not call the model. Optional `review_after_seconds`
+sets a review deadline. Suspension survives a manager restart, and observer
+heartbeats do not wake it. Reuse `after_cursor` to catch changes between calls.
+Repeated identical tool failures block with an actionable error; repeated unchanged
+inspection suspends when workers are active. Existing explicit ceilings still apply.
 
 Manager `codex_send` accepts `notification_kind` (`progress`, `failure`,
 `escalation`, or `final`), `task_key`, `checkpoint`, and `progress_cursor`. Progress
@@ -92,13 +99,20 @@ manager discipline; this is not a natural-language duplicate detector.
 Chat lists show the task rather than the Codex transport envelope, recover old
 truncated titles from original instructions, and show searchable latest-request
 previews. Original transcripts and explicitly chosen titles are preserved.
+The chat shows manager spend, unknown charges, waiting, review and blocked counts,
+last meaningful progress, and compaction. Settings includes the packaged build's
+revision and source fingerprint so an old installed app is distinguishable from the
+checkout. Building a new app does not install it.
 
 ### Pi native context compaction
 
-The coordinator watches context usage for its assigned sessions and can request
+The scheduler watches context usage for its assigned sessions and requests native
+compaction at a safe idle boundary above 200,000 tokens by default. Configure new
+chats in Settings or use `--pi-compaction-tokens`; `0` disables this policy. Only
+fresh, exact live instances owned by an accepted assignment are eligible.
+The coordinator can also request
 `pi_agents` with `action: "compact"`, an observed `session_id` and `instance_id`,
-and a stable `request_id`. Its policy recommends this around 80% context usage or
-when the worker reports pressure. This uses Pi's native `ctx.compact` API, not a
+and a stable `request_id` when the worker reports pressure. This uses Pi's native `ctx.compact` API, not a
 `/compact` chat message or a replacement summary authored by Conductor.
 
 Busy requests wait for an idle boundary with no tools or pending messages. Urgent
@@ -111,6 +125,15 @@ observer reload. Pi runtimes without the native API reject the request explicitl
 Install the updated observer using the existing installer; automatic reload waits
 for a safe idle point. Updating this repository alone does not update a live Pi
 runtime or compact any existing session.
+
+For long active turns, Pi's own automatic compaction must also be configured early
+enough. `scripts/configure-pi-compaction.py --help` documents a native Pi settings
+helper: supply the exact provider/model and its verified context-window size,
+then use `--target-tokens 200000 --dry-run` to preview the change. Remove `--dry-run`
+to write only that model's `compaction.modelOverrides` reserve and recent-token
+settings atomically. It preserves unrelated settings and an explicitly disabled
+global compaction policy. Existing Pi processes must reload their native settings;
+the helper does not restart or steer them.
 
 ### Execution ownership
 
@@ -130,6 +153,10 @@ including environment inspection and verification. Codex discovers sessions with
 `pi_sessions`, reads their public context with `pi_context`, and delegates with
 `pi_dispatch` using an exact session/instance, explicit ownership, and acceptance
 criteria. Busy agents receive follow-ups without replacing their current task.
+For steering an existing routed assignment, use `pi_control` with its original
+`request_id`, a unique `control_id`, and `steer` or `follow_up`; this preserves the
+owner and acceptance contract without creating another task. Repeating an unknown
+delivery does not resend it: reconcile the owner's state before taking further action.
 Conductor exposes no local shell/data/environment execution tool and never falls
 back to local execution when a Pi attachment is missing.
 
@@ -444,11 +471,14 @@ python3 -m conductor resume --run RUN --context-budget 40000
 - Resuming never blindly repeats an interrupted tool call. Missing results are
   marked **outcome unknown** so the coordinator can inspect actual state and assign
   fresh recovery tasks. Interrupted workers are not automatically retried in-place.
-- `--max-calls` defaults to 200 provider requests across the durable run, including
-  compaction and retries. Reservations persist before a request is sent. Usage is
-  recorded when replies arrive; a crash can leave actual billed usage unknown.
-  `--max-turns` defaults to 60 per agent execution; `--max-tasks` defaults to 12
-  total worker tasks. A request ceiling is not a dollar budget.
+- `--max-calls`, `--max-turns`, and `--max-tasks` default to `0` (unlimited).
+  Explicit positive limits remain enforced across the corresponding run/agent scope.
+  Provider calls include compaction and retries. `requests.json` records request ID,
+  model, purpose, agent, latency, retry, cost, and unknown outcomes; reservations
+  persist before sending. A crash or ambiguous delivery pauses further calls rather
+  than replaying potentially billed requests. Missing cost also pauses a run with
+  an explicit spend threshold. The ledger covers this run's Python OpenRouter
+  provider, not all usage on the key or Pi's separate generation calls.
 - The OpenRouter key stays in coordinator memory. Workers use an owner-only Unix
   socket to call the provider. Runtime directories use restrictive permissions.
   Transcripts and command logs can still contain sensitive project content; do not
@@ -479,8 +509,9 @@ or hosted web UI.
 The Codex engine uses app-server's experimental dynamic-tool API. It does not expose
 a reliable per-request API counter: the legacy `max_calls` ceiling applies to Python
 workers, not native Codex requests. Native tool/turn counts and time limits are tracked
-separately. These are execution ceilings, not dollar budgets. The legacy loop keeps
-its original request ceiling and 16,384-token output limit.
+separately. Native app-server inference is outside the Python provider spend ledger;
+the spend threshold only governs calls through that provider. The legacy loop keeps
+its 16,384-token output limit.
 
 Integration references:
 [Codex app-server](https://learn.chatgpt.com/docs/app-server),

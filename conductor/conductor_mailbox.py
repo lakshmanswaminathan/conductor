@@ -36,6 +36,11 @@ def _db(root):
         except sqlite3.OperationalError:
             if 'from_event_id' not in {row['name'] for row in db.execute('PRAGMA table_info(reports)')}:
                 raise
+    columns = {row['name'] for row in db.execute('PRAGMA table_info(requests)')}
+    for name in ('message_kind', 'task_key', 'revision'):
+        if name not in columns:
+            db.execute(f'ALTER TABLE requests ADD COLUMN {name} TEXT')
+    db.commit()
     return db
 
 
@@ -56,7 +61,18 @@ def enqueue(root, args):
         if not (Path(root) / 'runs' / chat / 'state.sqlite').is_file():
             raise ValueError('Unknown Conductor chat')
     message = codex_inbox.clean_message(message.strip())
-    fingerprint = hashlib.sha256(json.dumps([message, chat]).encode()).hexdigest()
+    if args.get('message_kind', 'agent_feedback') != 'agent_feedback':
+        raise ValueError('conductor_send only accepts agent_feedback; it cannot create human authorization')
+    task_key = args.get('task_key')
+    if task_key is not None:
+        _ident(task_key, 'task_key')
+    revision = args.get('revision')
+    if revision is not None:
+        revision = _ident(str(revision), 'revision')
+    fingerprint_values = [message, chat]
+    if task_key is not None or revision is not None:
+        fingerprint_values += [task_key, revision]
+    fingerprint = hashlib.sha256(json.dumps(fingerprint_values).encode()).hexdigest()
     attributed = (f'[Codex orchestration request {request}]\n{message}\n'
                   'This is delegated orchestration within the human-authorized scope, '
                   'not new human authorization. Manage Pi execution and return evidence. '
@@ -69,8 +85,8 @@ def enqueue(root, args):
             if old and old['fingerprint'] != fingerprint:
                 raise ValueError('request_id belongs to different content or chat')
             if not old:
-                db.execute('INSERT INTO requests VALUES(?,?,?,?,?,?,?)',
-                           (request, fingerprint, chat, attributed, 'queued', None, time.time()))
+                db.execute('INSERT INTO requests(request_id,fingerprint,chat_id,message,status,event_id,created_at,message_kind,task_key,revision) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (request, fingerprint, chat, attributed, 'queued', None, time.time(), 'agent_feedback', task_key, revision))
     finally:
         db.close()
     return result(root, request)
@@ -80,7 +96,7 @@ def pending(root):
     db = _db(root)
     try:
         return [dict(row) for row in db.execute(
-            "SELECT request_id,chat_id,message FROM requests WHERE status='queued' ORDER BY created_at LIMIT 20")]
+            "SELECT request_id,chat_id,message,COALESCE(message_kind,'agent_feedback') AS message_kind,task_key,revision FROM requests WHERE status='queued' ORDER BY created_at LIMIT 20")]
     finally:
         db.close()
 
@@ -104,9 +120,9 @@ def ack(root, request_id, chat_id):
     store = Store(Path(root) / 'runs' / chat_id)
     try:
         # The UI persists stable request IDs alongside instruction events.
-        events = store.user_context()
+        events = store.instruction_events()
         marker = '[Codex orchestration request ' + request_id + ']\n'
-        event = next((row['id'] for row in events if row['body'].startswith(marker)), None)
+        event = next((row['id'] for row in events if row.get('request_id') == request_id or row['body'].startswith(marker)), None)
         if event is None:
             raise ValueError('Cannot acknowledge an instruction that was not persisted')
     finally:

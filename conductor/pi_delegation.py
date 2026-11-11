@@ -104,7 +104,7 @@ def delegate(store, args):
     else:
         if store.agent(ident):
             raise ValueError('Task ID already exists')
-        if len(managed_agents(store)) - bool(previous) >= config.get('max_tasks', 100):
+        if config.get('max_tasks', 0) > 0 and len(managed_agents(store)) - bool(previous) >= config['max_tasks']:
             raise ValueError('Run task ceiling reached')
         if not _live(spec):
             raise ValueError('Exact live Pi session and instance required')

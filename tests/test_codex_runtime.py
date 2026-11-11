@@ -111,6 +111,14 @@ class CodexRuntimeTests(unittest.TestCase):
         run_codex_coordinator(self.store, 'fixture-only-key', binary='fake-codex')
         return FakeServer.instances[-1]
 
+    def test_resolved_feedback_is_not_reintroduced_by_native_supervision(self):
+        self.store.add_feedback('Archived obsolete instruction', 'obsolete')
+        self.store.resolve_feedback('obsolete', ['artifact:replacement'], 'superseded')
+        server = self.run_native()
+        inputs = json.dumps([params for method, params in server.requests if method == 'turn/start'])
+        self.assertNotIn('Archived obsolete instruction', inputs)
+        self.assertEqual(server.turns, 1)
+
     def test_native_final_persistent_thread_resume_and_usage(self):
         first = self.run_native()
         self.assertEqual(self.store.agent('coordinator')['state'], 'done')
@@ -199,8 +207,14 @@ class CodexRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'nonempty final'):
             self.run_native()
 
+    def test_zero_run_limits_are_unlimited(self):
+        FakeServer.scenario = 'tool'
+        self.store.configure(max_turns=0, codex_max_tool_calls=0, codex_timeout_seconds=0)
+        self.run_native()
+        self.assertEqual(self.store.agent('coordinator')['state'], 'done')
+
     def test_deadline_is_bounded(self):
-        self.store.configure(codex_timeout_seconds=0)
+        self.store.configure(codex_timeout_seconds=0.000001)
         with self.assertRaisesRegex(RuntimeError, 'deadline'):
             self.run_native()
         self.assertTrue(FakeServer.instances[-1].closed)
