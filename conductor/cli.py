@@ -10,7 +10,7 @@ import sys
 import uuid
 
 from .demo import DemoProvider
-from .provider import OpenRouter
+from .provider import spend_limit, OpenRouter
 from .runtime import cmux_binary, git, run_coordinator, run_worker
 from .store import Store
 from .models import DEFAULT_MODEL
@@ -31,7 +31,7 @@ def initialize(root, repo, goal, **options):
             raise ValueError('Keep the run directory outside the target repository for coding runs')
     store = Store(root)
     config = dict(repo=str(repo), base=base, model=DEFAULT_MODEL, concurrency=3,
-                  context_budget=24000, max_turns=0, max_tasks=12, max_calls=200,
+                  context_budget=24000, max_turns=0, max_tasks=0, max_calls=0, max_spend=None, pi_compaction_tokens=200000,
                   allow_exec=False, transport='cmux', demo=False, scope='repository')
     config.update(options)
     store.configure(**config)
@@ -44,7 +44,7 @@ def initialize(root, repo, goal, **options):
 
 def provider_for(store, key=None):
     config = store.config()
-    return DemoProvider() if config['demo'] else OpenRouter(config['model'], key=key, max_calls=config['max_calls'], state_path=store.root)
+    return DemoProvider() if config['demo'] else OpenRouter(config['model'], key=key, max_calls=config['max_calls'], state_path=store.root, max_spend=config.get('max_spend'))
 
 
 def positive(value):
@@ -75,8 +75,10 @@ def parser():
         command.add_argument('--concurrency', type=positive, default=3)
         command.add_argument('--context-budget', type=positive, default=24000, help='Conservative input byte budget; output tokens reserved separately')
         command.add_argument('--max-turns', type=turn_limit, default=0, help='Agent turn limit; 0 means unlimited (default)')
-        command.add_argument('--max-tasks', type=positive, default=12)
-        command.add_argument('--max-calls', type=positive, default=200)
+        command.add_argument('--max-tasks', type=turn_limit, default=0, help='Task ceiling; 0 means unlimited')
+        command.add_argument('--max-calls', type=turn_limit, default=0, help='API request ceiling; 0 means unlimited')
+        command.add_argument('--pi-compaction-tokens', type=turn_limit, default=200000, help='Compact assigned idle Pi sessions above this context token count; 0 disables')
+        command.add_argument('--max-spend', type=spend_limit, help='Optional USD postpaid stop threshold; blank is unlimited, may overshoot by one call')
         command.add_argument('--allow-exec', action='store_true', help='Enable shell tools; filesystem mode edits actual files directly')
     for name in ['resume', 'chat', 'status', 'context', 'say', 'resolve', 'history']:
         command = sub.add_parser(name)
@@ -96,6 +98,8 @@ def parser():
             command.add_argument('--agent', default='coordinator')
             command.add_argument('--after', type=int, default=0)
         if name == 'resume':
+            command.add_argument('--max-spend', type=spend_limit, default=argparse.SUPPRESS, help='Change cumulative USD stop threshold')
+            command.add_argument('--pi-compaction-tokens', type=turn_limit, default=argparse.SUPPRESS)
             command.add_argument('--context-budget', type=positive)
     sub.add_parser('doctor')
     ui = sub.add_parser('ui-server', help=argparse.SUPPRESS)
@@ -141,7 +145,7 @@ def main(argv=None):
             root = args.run or Path.cwd() / '.conductor' / (datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6])
             repo = args.repo or (Path.home() if args.filesystem else Path.cwd())
             store = initialize(root, repo, args.goal, **{k: getattr(args, k) for k in
-                ['model', 'concurrency', 'context_budget', 'max_turns', 'max_tasks', 'max_calls', 'allow_exec', 'transport']},
+                ['model', 'concurrency', 'context_budget', 'max_turns', 'max_tasks', 'max_calls', 'max_spend', 'pi_compaction_tokens', 'allow_exec', 'transport']},
                 demo=args.command == 'demo', scope='filesystem' if args.filesystem else 'repository')
             print('Run:', store.root, flush=True)
             run_coordinator(store, provider_for(store))
@@ -201,6 +205,9 @@ def main(argv=None):
                         run_coordinator(store, provider_for(store, key))
                 return 0
             if args.command == 'resume':
+                for option in ('max_spend', 'pi_compaction_tokens'):
+                    if hasattr(args, option):
+                        store.configure(**{option: getattr(args, option)})
                 if args.context_budget:
                     store.configure(context_budget=args.context_budget)
                 run_coordinator(store, provider_for(store))

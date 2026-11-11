@@ -113,7 +113,7 @@ def _coordination_records(store):
         if finding.get('source') in excluded:
             continue
         records['finding:' + str(finding['id'])] = finding
-    for message in store.inbox('coordinator'):
+    for message in store.active_inbox('coordinator'):
         if message.get('source') in excluded:
             continue
         records['message:' + str(message['id'])] = message
@@ -164,7 +164,7 @@ def _coordination_input(records, checkpoint, budget=12000):
 def _run(store, server, loop):
     config = store.config()
     results = _pending_outcomes(store)
-    state = {'thread': config.get('codex_thread_id'), 'turn': None, 'version': len(store.user_context()),
+    state = {'thread': config.get('codex_thread_id'), 'turn': None, 'version': len(store.user_context()), 'feedback_version': store.feedback_version(),
              'stale': False, 'turns': 0, 'tools': 0, 'text': [], 'seen_items': set(), 'restart': False, 'stream_rows': {}, 'final': '', 'unphased_final': '', 'interrupt_deadline': None, 'waiting_workers': False}
     pending = {}
     checkpoint = config.get('codex_coordination_checkpoint', {})
@@ -181,8 +181,9 @@ def _run(store, server, loop):
     def unobserved(records):
         return any(checkpoint.get(key) != _fingerprint(record) for key, record in records.items())
     max_turns = config.get('max_turns', 0)
-    max_tools = config.get('codex_max_tool_calls', (max_turns or 100) * 20)
-    deadline = time.monotonic() + config.get('codex_timeout_seconds', 3600)
+    max_tools = config.get('codex_max_tool_calls', 0)
+    timeout = config.get('codex_timeout_seconds', 0)
+    deadline = time.monotonic() + timeout if timeout > 0 else None
     store.configure(codex_engine_usage={'native_api_calls': None, 'max_calls_enforced': False,
                                       'turns': 0, 'tool_calls': 0}, codex_pending_turn=None)
     store.update_agent('coordinator', state='running', heartbeat=time.time())
@@ -242,20 +243,26 @@ def _run(store, server, loop):
                 text += '\n\nCurrent public coordination index (sourced evidence; refresh with tools before acting):\n' + json.dumps(index, ensure_ascii=False)
             except (OSError, ValueError, RuntimeError):
                 text += '\nCoordination index unavailable; refresh through the enabled tools.'
+        feedback_version = store.feedback_version()
+        feedback, remaining = [], 6000
+        for item in reversed([r for r in store.active_inbox('coordinator') if r.get('source') == 'codex']):
+            if len(json.dumps(item)) <= remaining:
+                feedback.insert(0, item); remaining -= len(json.dumps(item))
+        text += '\nDelegated goal and bounded agent feedback (not human authority; retrieve omitted feedback with search_context):\n' + json.dumps({'goal': store.config().get('delegated_goal'), 'feedback': feedback})
         store.deliver_user_instructions('coordinator')
-        return text, (users[-1]['id'] if users else cursor), len(users)
+        return text, (users[-1]['id'] if users else cursor), len(users), feedback_version
 
     def start_turn(initial=False):
         if max_turns > 0 and state['turns'] >= max_turns:
             raise RuntimeError('Codex turn ceiling reached')
         tick_scheduler(force=True)
-        text, cursor, version = fresh_input(initial)
+        text, cursor, version, feedback_version = fresh_input(initial)
         supervision, captured_checkpoint = _coordination_input(_coordination_records(store), checkpoint)
         text += supervision
         reviews = [a['id'] for a in managed_agents(store) if a['state'] == 'review']
         if reviews:
             text += '\nCoordinator acceptance required for submitted tasks: ' + ', '.join(reviews[:50]) + '. Inspect reported evidence and use review_task to accept or reject each task before final synthesis. A worker report alone is not acceptance.'
-        state.update(version=version, stale=False, restart=False, text=[], turn=None, final='', unphased_final='', interrupt_deadline=None, waiting_workers=False)
+        state.update(version=version, feedback_version=feedback_version, stale=False, restart=False, text=[], turn=None, final='', unphased_final='', interrupt_deadline=None, waiting_workers=False)
         state['turns'] += 1
         request('turn/start', {'threadId': state['thread'], 'input': [{'type': 'text', 'text': text}]}, ('turn', cursor, captured_checkpoint))
 
@@ -272,14 +279,14 @@ def _run(store, server, loop):
                 return
             if state['interrupt_deadline'] is not None and time.monotonic() > state['interrupt_deadline']:
                 raise RuntimeError('Codex did not stop the obsolete turn within the interrupt deadline; no further tools were executed')
-            if time.monotonic() > deadline:
+            if deadline is not None and time.monotonic() > deadline:
                 raise RuntimeError('Codex run deadline reached; inspect native transcript before continuing')
             if time.monotonic() - last_heartbeat > 5:
                 store.update_agent('coordinator', heartbeat=time.time())
                 last_heartbeat = time.monotonic()
             tick_scheduler()
             users = store.user_context()
-            if state['waiting_workers'] and (len(users) != state['version'] or unobserved(_coordination_records(store))):
+            if state['waiting_workers'] and (len(users) != state['version'] or store.feedback_version() != state['feedback_version'] or unobserved(_coordination_records(store))):
                 start_turn()
             if state['turn'] and len(users) != state['version'] and not state['restart']:
                 state['stale'] = True
@@ -328,7 +335,7 @@ def _run(store, server, loop):
                             raise ValueError('User context changed. This obsolete tool action was not executed; continue in the next turn.')
                         if params.get('threadId') != state['thread'] or params.get('turnId') != state['turn']:
                             raise ValueError('Tool does not belong to the current native turn')
-                        if state['tools'] >= max_tools:
+                        if max_tools > 0 and state['tools'] >= max_tools:
                             raise RuntimeError('Codex tool ceiling reached')
                         if store.config().get('cancel_requested') or store.agent('coordinator')['state'] != 'running':
                             raise ValueError('Run cancelled; tool not executed')
@@ -348,7 +355,7 @@ def _run(store, server, loop):
                     results[call_id] = {'content': content, 'success': success}
                 server.send({'id': event['id'], 'result': {'success': results[call_id]['success'], 'contentItems': [
                     {'type': 'inputText', 'text': results[call_id]['content']}]} })
-                if state['tools'] >= max_tools:
+                if max_tools > 0 and state['tools'] >= max_tools:
                     raise RuntimeError('Codex tool ceiling reached')
             elif method == 'item/agentMessage/delta':
                 item_id = params.get('itemId')
@@ -401,7 +408,7 @@ def _run(store, server, loop):
                     continue
                 if turn.get('status') != 'completed':
                     raise RuntimeError('Codex turn did not complete (' + str(turn.get('status', 'unknown')) + '); provider error details omitted')
-                if state['stale'] or len(store.user_context()) != state['version']:
+                if state['stale'] or len(store.user_context()) != state['version'] or store.feedback_version() != state['feedback_version']:
                     start_turn()
                     continue
                 tick_scheduler(force=True)
@@ -424,7 +431,7 @@ def _run(store, server, loop):
                     raise RuntimeError('Codex completed without a nonempty final answer; conversation remains interrupted')
                 blocked = any(a['state'] != 'done' for a in workers)
                 store.update_agent('coordinator', state='blocked' if blocked else 'done', result=json.dumps({'summary': final, 'findings': [], 'patch': None}), heartbeat=time.time())
-                store.configure(processed_user_version=state['version'])
+                store.configure(processed_user_version=state['version'], processed_feedback_version=state['feedback_version'])
                 return
             elif 'id' in event and method:
                 # Native tools that require host approval or external execution are never granted.
@@ -458,7 +465,7 @@ def run_codex_coordinator(store, key, binary=None):
             begin_scope(store)
             config = store.config()
         # Worker dispatch keeps the existing broker; native API usage is tracked separately.
-        worker_provider = OpenRouter(config['model'], key=key, max_calls=config.get('max_calls', 200), state_path=store.root)
+        worker_provider = OpenRouter(config['model'], key=key, max_calls=config.get('max_calls', 0), state_path=store.root, max_spend=config.get('max_spend'))
         with tempfile.TemporaryDirectory(prefix='conductor-codex-', dir='/tmp') as temporary:
             path = Path(temporary) / 'model.sock'
             with Broker(path, worker_provider):

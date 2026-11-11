@@ -52,20 +52,21 @@ class PiRouterTests(unittest.TestCase):
         self.assertEqual(pi_router.dispatch(self.root,self.args)['delivery']['status'],'unknown')
         first_call=self.monitor.command.call_args
         self.monitor.command.return_value={'status':'accepted'}
-        self.assertEqual(pi_router.dispatch(self.root,self.args)['delivery']['status'],'accepted')
+        self.assertEqual(pi_router.dispatch(self.root,self.args)['delivery']['status'],'unknown')
         self.assertEqual(self.monitor.command.call_args,first_call)
-        self.assertEqual(self.monitor.command.call_count,2)
+        self.assertEqual(self.monitor.command.call_count,1)
         with self.assertRaisesRegex(ValueError,'different Pi assignment'):
             pi_router.dispatch(self.root,self.args|{'task':'different'})
         with self.assertRaisesRegex(ValueError,'no local fallback'):
             pi_router.dispatch(self.root,self.args|{'request_id':'new','instance_id':'stale'})
-        self.assertEqual(self.monitor.command.call_count,2)
+        self.assertEqual(self.monitor.command.call_count,1)
 
     def test_interrupted_before_delivery_recovers_and_oversized_payload_leaves_no_task(self):
         with patch.object(self.monitor,'command',side_effect=OSError('interrupted')):
             with self.assertRaises(OSError):
                 pi_router.dispatch(self.root,self.args)
-        self.assertEqual(pi_router.dispatch(self.root,self.args)['delivery']['status'],'accepted')
+        self.assertEqual(pi_router.dispatch(self.root,self.args)['delivery']['status'],'unknown')
+        self.monitor.command.assert_not_called()
         oversized=self.args|{'request_id':'large','ownership':['a'*300]*20,'acceptance':['b'*300]*20}
         with self.assertRaisesRegex(ValueError,'size limit'):
             pi_router.dispatch(self.root,oversized)
@@ -100,3 +101,67 @@ class PiRouterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pi_router.dispatch(self.root,self.args|{'ownership':[]})
         self.monitor.command.assert_not_called()
+
+    def test_control_preserves_owner_task_contract_and_is_idempotent(self):
+        original = pi_router.dispatch(self.root, self.args)
+        args = {'request_id': 'request-a', 'control_id': 'control-1', 'action': 'steer', 'message': 'Check the earlier evidence'}
+        receipt = pi_router.control(self.root, args)
+        self.assertEqual(pi_router.control(self.root, args), receipt)
+        self.assertEqual(self.monitor.command.call_count, 2)
+        call = self.monitor.command.call_args.args
+        self.assertEqual(call[:2], ('pi-a', 'instance-a'))
+        self.assertEqual(call[3], 'steer')
+        self.assertIn(original['task_id'], call[4])
+        broker = SwarmBroker(self.root, self.monitor)
+        self.assertEqual(broker.db.execute('SELECT count(*) FROM tasks').fetchone()[0], 1)
+        broker.close()
+        self.assertEqual(pi_router.result(self.root, 'request-a')['task'], original['task'])
+        with self.assertRaisesRegex(ValueError, 'different content'):
+            pi_router.control(self.root, args | {'message': 'different'})
+
+    def test_control_stale_instance_and_terminal_report_fail_closed(self):
+        original = pi_router.dispatch(self.root, self.args)
+        args = {'request_id': 'request-a', 'control_id': 'control-1', 'action': 'follow_up', 'message': 'Continue'}
+        self.monitor.bridges.return_value = {'pi-a': {'instance_id': 'replacement'}}
+        with self.assertRaisesRegex(ValueError, 'stale instance'):
+            pi_router.control(self.root, args)
+        self.monitor.bridges.return_value = {'pi-a': {'instance_id': 'instance-a'}}
+        broker = SwarmBroker(self.root, self.monitor)
+        broker.call('pi-a', 'swarm_task', {'action':'update', 'task_id':original['task_id'], 'status':'completed',
+                                         'result':'done', 'request_id':'done'})
+        broker.close()
+        with self.assertRaisesRegex(ValueError, 'new assignment'):
+            pi_router.control(self.root, args)
+        self.assertEqual(self.monitor.command.call_count, 1)
+
+    def test_unknown_control_is_not_replayed_even_after_instance_change(self):
+        pi_router.dispatch(self.root, self.args)
+        args = {'request_id': 'request-a', 'control_id': 'control-1', 'action': 'follow_up', 'message': 'Continue'}
+        self.monitor.command.side_effect = OSError('connection interrupted')
+        with self.assertRaises(OSError):
+            pi_router.control(self.root, args)
+        self.monitor.command.side_effect = None
+        self.monitor.bridges.return_value = {'pi-a': {'instance_id':'replacement'}}
+        receipt = pi_router.control(self.root, args)
+        self.assertEqual(receipt['delivery']['status'], 'unknown')
+        self.assertIn('not be replayed', receipt['reconciliation'])
+        self.assertEqual(self.monitor.command.call_count, 2)
+
+    def test_control_rejects_unknown_assignment_delivery(self):
+        self.monitor.command.return_value = {'status':'unknown'}
+        pi_router.dispatch(self.root, self.args)
+        with self.assertRaisesRegex(ValueError, 'reconcile'):
+            pi_router.control(self.root, {'request_id':'request-a', 'control_id':'control-1',
+                                        'action':'steer', 'message':'Continue'})
+        self.assertEqual(self.monitor.command.call_count, 1)
+
+    def test_control_rejects_changed_task_owner(self):
+        original = pi_router.dispatch(self.root, self.args)
+        broker = SwarmBroker(self.root, self.monitor)
+        with broker.db:
+            broker.db.execute('UPDATE tasks SET owner=? WHERE task_id=?', ('pi-b', original['task_id']))
+        broker.close()
+        with self.assertRaisesRegex(ValueError, 'ownership changed'):
+            pi_router.control(self.root, {'request_id':'request-a', 'control_id':'control-1',
+                                         'action':'steer', 'message':'Continue'})
+        self.assertEqual(self.monitor.command.call_count, 1)

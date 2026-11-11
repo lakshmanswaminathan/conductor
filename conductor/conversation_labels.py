@@ -30,8 +30,11 @@ def compact(text, limit):
 def conversation_labels(store, config, agent):
     title = str(config.get('title') or '').strip()
     # Old titles were truncated before the task, so recover from the full event.
-    first = store.db.execute("SELECT body FROM events WHERE source='user' AND kind='instruction' ORDER BY id LIMIT 1").fetchone()
-    latest = store.db.execute("SELECT body FROM events WHERE source='user' AND kind='instruction' ORDER BY id DESC LIMIT 1").fetchone()
+    # Display both human requests and attributed Codex feedback without promoting
+    # the latter into model authority.
+    instructions = store.instruction_events()
+    first = instructions[0] if instructions else None
+    latest = instructions[-1] if instructions else None
     if not title or title.lower().startswith('[codex orchestration '):
         title = request_text(first['body'] if first else agent.get('task', ''))
     else:

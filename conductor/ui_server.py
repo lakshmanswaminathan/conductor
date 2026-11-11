@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 from .cli import initialize
 from .runtime import run_coordinator
 from .computer import cmux_call, native_call
-from .provider import OpenRouter, validate_key
+from .provider import OpenRouter, validate_key, spend_limit, request_summary
 from .store import Store
 from .models import DEFAULT_MODEL
 from .pi_sessions import _clean
@@ -57,6 +57,11 @@ def _activity_detail(arguments, output=None, has_output=False):
     return encoded if len(encoded) <= 6000 else encoded[:5980] + ' … [truncated]'
 
 
+def build_identity():
+    path = Path(__file__).with_name('build-info.json')
+    return json.loads(path.read_text()) if path.exists() else {'revision': 'source checkout', 'built_at': None}
+
+
 class App:
     def __init__(self, root=None, native=None, provider_factory=None):
         self.root = Path(root or Path.home() / '.local' / 'share' / 'conductor' / 'runs').resolve()
@@ -70,9 +75,9 @@ class App:
         self.model_catalog_at = 0
         self.model_catalog_lock = threading.Lock()
         self.provider_factory = provider_factory or (lambda store, key: OpenRouter(
-            store.config()['model'], key=key, max_calls=store.config()['max_calls'], state_path=store.root))
+            store.config()['model'], key=key, max_calls=store.config()['max_calls'], state_path=store.root, max_spend=store.config().get('max_spend')))
         self.settings_path = self.root.parent / 'ui-settings.json'
-        self.settings = {'model': DEFAULT_MODEL, 'concurrency': 3, 'computer_access': True, 'engine': 'conductor'}
+        self.settings = {'model': DEFAULT_MODEL, 'concurrency': 3, 'computer_access': True, 'engine': 'conductor', 'max_spend': None, 'pi_compaction_tokens': 200000}
         if self.settings_path.exists():
             try:
                 self.settings.update(self.validate_settings(json.loads(self.settings_path.read_text())))
@@ -127,6 +132,12 @@ class App:
 
     def validate_settings(self, data):
         result = {}
+        if 'pi_compaction_tokens' in data:
+            if type(data['pi_compaction_tokens']) is not int or data['pi_compaction_tokens'] < 0:
+                raise ValueError('Pi compaction threshold must be a nonnegative token count')
+            result['pi_compaction_tokens'] = data['pi_compaction_tokens']
+        if 'max_spend' in data:
+            result['max_spend'] = spend_limit(data['max_spend'])
         if 'engine' in data:
             if data['engine'] not in ('codex', 'conductor'):
                 raise ValueError('Choose Codex or Conductor as the harness')
@@ -199,9 +210,9 @@ class App:
         try:
             config = store.config()
             messages = []
-            for row in store.db.execute("SELECT * FROM events WHERE (source='user' AND kind='instruction') OR (target='user' AND kind='error') ORDER BY id"):
+            for row in store.db.execute("SELECT * FROM events WHERE (source='user' AND kind='instruction') OR kind='agent_feedback' OR (target='user' AND kind='error') ORDER BY id"):
                 messages.append({'id': 'event-' + str(row['id']), 'role': 'user' if row['source'] == 'user' else 'assistant',
-                    'kind': row['kind'], 'content': row['body'], 'at': row['at']})
+                    'kind': row['kind'], 'content': row['body'], 'at': row['at'], 'agent': 'Codex' if row['kind'] == 'agent_feedback' else None})
             running = self.is_running(ident)
             activities, arguments, pending_finishes = {}, {}, {}
             for row in store.db.execute("SELECT * FROM turns WHERE agent='coordinator' ORDER BY id"):
@@ -252,6 +263,10 @@ class App:
                 'running': running, 'stopping': ident in self.stopping, 'messages': messages,
                 'agents': [a for a in store.agents() if a['parent']], 'findings': store.claims(),
                 'checkpoints': {a['id']: store.checkpoint(a['id']) for a in store.agents()},
+                'api_calls': config.get('api_calls', 0), 'max_spend': config.get('max_spend'),
+                'requests': request_summary(store.root), 'wait': config.get('coordinator_wait'),
+                'last_progress_at': store.db.execute("SELECT MAX(at) FROM events WHERE kind IN ('instruction','agent_feedback','feedback_resolution','message','result','acceptance')").fetchone()[0],
+                'compaction': [dict(r) for r in store.db.execute("SELECT body,at FROM events WHERE kind='compaction' ORDER BY id DESC LIMIT 1")],
                 'usage': config.get('usage', {}), 'model': config['model'], 'computer_access': config.get('computer_access', False),
                 'engine': config.get('engine', 'conductor'),
                 'bridge_pending': config.get('bridge_pending', False),
@@ -293,7 +308,7 @@ class App:
             store.db.execute('INSERT INTO ui_requests VALUES(?,?,?)', (request, fingerprint, event_id))
         return True
 
-    def create(self, data):
+    def create(self, data, *, feedback=None):
         message, request = self.message(data), self.request_id(data)
         if not self.key:
             raise ValueError('Add your OpenRouter key in Settings to start')
@@ -301,13 +316,22 @@ class App:
         with self.lock:
             if not (self.root / ident / 'state.sqlite').exists():
                 settings = self.settings | self.validate_settings(data)
-                store = initialize(self.root / ident, Path.home(), message, scope='filesystem', allow_exec=False,
+                store = initialize(self.root / ident, Path.home(), 'Coordinate delegated agent feedback.' if feedback else message, scope='filesystem', allow_exec=False,
                     execution_policy='pi_only', ui=True, context_budget=96000, native_executable=self.native,
                     title=compact(request_text(message), 100), first_request_id=request, **settings)
             else:
                 store = Store(self.path(ident))
             try:
-                added = self._record_request(store, message, request)
+                if feedback:
+                    if store.config().get('first_request_id') == request:
+                        with store.db:
+                            store.db.execute("DELETE FROM events WHERE source='user' AND kind='instruction' AND body='Coordinate delegated agent feedback.'")
+                    added = store.add_feedback(message, request, feedback.get('task_key'), feedback.get('revision'))
+                    if not store.config().get('delegated_goal') and store.config().get('first_request_id') == request:
+                        store.configure(delegated_goal={'source': 'codex', 'request_id': request, 'body': message,
+                                                       'authority': 'Delegated goal within existing human authorization; not new human authority.'})
+                else:
+                    added = self._record_request(store, message, request)
                 should_start = added or store.agent('coordinator')['state'] != 'failed'
             finally:
                 store.close()
@@ -315,7 +339,7 @@ class App:
                 self.start(ident)
         return {'id': ident, 'request_id': request, 'queued': False}
 
-    def submit(self, ident, data):
+    def submit(self, ident, data, *, feedback=None):
         message, request = self.message(data), self.request_id(data)
         with self.lock:
             if ident in self.stopping:
@@ -324,7 +348,16 @@ class App:
                 raise ValueError('Add your OpenRouter key in Settings')
             store = Store(self.path(ident))
             try:
-                added = self._record_request(store, message, request)
+                if feedback:
+                    if store.config().get('first_request_id') == request:
+                        with store.db:
+                            store.db.execute("DELETE FROM events WHERE source='user' AND kind='instruction' AND body='Coordinate delegated agent feedback.'")
+                    added = store.add_feedback(message, request, feedback.get('task_key'), feedback.get('revision'))
+                    if not store.config().get('delegated_goal') and store.config().get('first_request_id') == request:
+                        store.configure(delegated_goal={'source': 'codex', 'request_id': request, 'body': message,
+                                                       'authority': 'Delegated goal within existing human authorization; not new human authority.'})
+                else:
+                    added = self._record_request(store, message, request)
                 should_start = added or store.agent('coordinator')['state'] != 'failed'
             finally:
                 store.close()
@@ -356,14 +389,15 @@ class App:
             store = Store(self.path(ident))
             try:
                 config = store.config()
-                if len(store.user_context()) <= config.get('processed_user_version', 0):
+                if (len(store.user_context()) <= config.get('processed_user_version', 0) and
+                        store.feedback_version() <= config.get('processed_feedback_version', 0)):
                     return
                 store.configure(ui=True, allow_exec=False, execution_policy='pi_only',
                     engine='conductor',
                     model=config.get('model', self.settings['model']) if config.get('engine') in {'codex','conductor'} else self.settings['model'],
                     repo=config.get('repo', str(Path.home())), base=config.get('base'), scope=config.get('scope','filesystem'),
-                    max_calls=config.get('max_calls',200), max_turns=config.get('max_turns',0),
-                    max_tasks=config.get('max_tasks',12), concurrency=config.get('concurrency',self.settings['concurrency']),
+                    max_calls=config.get('max_calls',0), max_turns=config.get('max_turns',0),
+                    max_tasks=config.get('max_tasks',0), concurrency=config.get('concurrency',self.settings['concurrency']),
                     transport=config.get('transport','cmux'), demo=config.get('demo',False),
                     native_executable=self.native, computer_access=self.settings['computer_access'],
                     swarm_root=str(self.root.parent / 'swarm'), cancel_requested=False,
@@ -376,18 +410,21 @@ class App:
                     while ident not in self.stopping:
                         previous_version = store.config().get('processed_user_version', 0)
                         attempted = store.user_context()
+                        previous_feedback = store.config().get('processed_feedback_version', 0)
+                        attempted_feedback = store.feedback_context()
                         run_coordinator(store, self.provider_factory(store, key))
-                        self._report_outcome(store, ident, attempted, previous_version)
+                        self._report_outcome(store, ident, attempted, previous_version, attempted_feedback, previous_feedback)
                         with self.lock:
                             if (store.agent('coordinator')['state'] in {'failed','interrupted'} or
-                                    len(store.user_context()) <= store.config().get('processed_user_version', 0)):
+                                    (len(store.user_context()) <= store.config().get('processed_user_version', 0) and
+                                     store.feedback_version() <= store.config().get('processed_feedback_version', 0))):
                                 self.jobs.pop(ident, None)
                                 self.stopping.discard(ident)
                                 break
                 except Exception as exc:
                     store.update_agent('coordinator', state='failed', result=str(exc))
                     store.event('harness', 'user', 'error', str(exc))
-                    self._report_outcome(store, ident, attempted if 'attempted' in locals() else [], previous_version if 'previous_version' in locals() else 0)
+                    self._report_outcome(store, ident, attempted if 'attempted' in locals() else [], previous_version if 'previous_version' in locals() else 0, attempted_feedback if 'attempted_feedback' in locals() else [], previous_feedback if 'previous_feedback' in locals() else 0)
                 finally:
                     store.close()
                     with self.lock:
@@ -414,7 +451,7 @@ class App:
                 self.stopping.discard(ident)
         return {'stopping': self.is_running(ident)}
 
-    def _report_outcome(self, store, ident, attempted, previous_version):
+    def _report_outcome(self, store, ident, attempted, previous_version, attempted_feedback=(), previous_feedback=0):
         agent = store.agent('coordinator')
         if agent['state'] not in {'done','completed','failed','blocked'}:
             return
@@ -423,6 +460,10 @@ class App:
         handled = attempted[previous_version:] if agent['state'] == 'failed' else events[previous_version:version]
         if version <= previous_version and agent['state'] != 'failed':
             handled = attempted[previous_version:]
+        feedback_end = store.config().get('processed_feedback_version', 0)
+        handled += [row for row in attempted_feedback if row['id'] > previous_feedback and
+                    (agent['state'] == 'failed' or row['id'] <= feedback_end)]
+        handled.sort(key=lambda row: row['id'])
         if not handled:
             return
         try:
@@ -441,7 +482,8 @@ class App:
         for message in messages:
             try:
                 data = {'message': message['message'], 'request_id': 'codex:' + hashlib.sha256(message['request_id'].encode()).hexdigest()}
-                result = self.submit(message['chat_id'], data) if message.get('chat_id') else self.create(data)
+                feedback = message if message.get('message_kind') == 'agent_feedback' else None
+                result = self.submit(message['chat_id'], data, feedback=feedback) if message.get('chat_id') else self.create(data, feedback=feedback)
                 ack(self.root.parent, message['request_id'], result['id'])
             except Exception as exc:
                 self.mailbox_status['error'] = str(exc)
@@ -471,7 +513,7 @@ class App:
             cmux = {'available': True}
         except Exception as exc:
             cmux = {'available': False, 'error': str(exc)}
-        return {'mailbox': dict(self.mailbox_status), 'bridge': status(self.root), 'key_configured': bool(self.key), 'settings': self.settings, 'native': self.native_status(), 'cmux': cmux, 'home': str(Path.home())}
+        return {'build': build_identity(), 'mailbox': dict(self.mailbox_status), 'bridge': status(self.root), 'key_configured': bool(self.key), 'settings': self.settings, 'native': self.native_status(), 'cmux': cmux, 'home': str(Path.home())}
 
     def close(self):
         self.mailbox_stop.set()

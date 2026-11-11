@@ -274,6 +274,8 @@ class PiDelegationTests(unittest.TestCase):
 
     def test_coordinator_exit_preserves_independent_pi_but_interrupts_local_worker(self):
         from conductor.runtime import run_coordinator
+        # Exercise cleanup after a provider failure, with room for the full swarm catalog.
+        self.store.configure(context_budget=40000)
         delegate(self.store, self.args)
         self.store.add_agent('local', 'coordinator', 'Local process')
         self.store.update_agent('local', state='running')

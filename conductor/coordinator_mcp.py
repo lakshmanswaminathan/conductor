@@ -7,7 +7,9 @@ import sys
 from . import conductor_mailbox, desktop_bridge, pi_router
 
 S = {'type':'string'}
-STRINGS = {'type':'array','items':S,'minItems':1,'maxItems':20}
+STRINGS = {'type':'array','items':{'type':'string','minLength':1,'maxLength':1000},'minItems':1,'maxItems':20}
+PI_ID = {'type':'string','pattern':'^[A-Za-z0-9_-]{1,128}$','minLength':1,'maxLength':128}
+CRITERIA = {'type':'array','items':{'type':'string','minLength':1,'maxLength':300},'minItems':1,'maxItems':20}
 ROUTING_INSTRUCTIONS = (
     'Route data generation through Conductor and its Pi agents. Codex can execute platform work '
     '(including v2 platform operations), code changes, inspection, configuration, and verification '
@@ -37,13 +39,17 @@ TOOLS = [
     tool('conductor_bypass','Choose direct Codex execution for this request (for example v2 platform work). No dispatch, model call, or persistent/global mode change. Data generation still routes to Conductor. This is routing guidance, not a permissions override.',
          {'operation':{'type':'string','enum':['data_generation','platform','code','other']}},['operation']),
     tool('conductor_send','Give data generation or explicitly delegated work to Conductor’s own model, which manages Pi agents. Platform work, including v2, can execute directly in Codex. Reuse request_id on retries; omit chat_id to create a new Conductor chat. Queued waits for the app and model key. Do not independently dispatch the same work to Pi.',
-         {'request_id':S,'chat_id':S,'message':S},['request_id','message']),
+         {'request_id':S,'chat_id':S,'message':{'type':'string','minLength':1,'maxLength':39000},
+          'message_kind':{'type':'string','enum':['agent_feedback']},'task_key':S,'revision':S},['request_id','message']),
     tool('conductor_result','Read delivery and the manager’s reported result for an orchestration request. Reports require evidence review.',{'request_id':S},['request_id']),
     tool('pi_sessions','Discover exact Pi session IDs, live instances, context, and update state for optional delegation.',{}),
     tool('pi_context','Read bounded public Pi context to select the correct existing task/session.',{'session_id':S},['session_id']),
     tool('pi_dispatch','Delegate explicitly requested work to an exact Pi harness. This tool does not restrict direct Codex execution outside delegated work. Preserve unrelated Pi work. Busy Pi receives a follow-up. Reuse request_id on retries; accepted means delivery, not completion.',
-         {'request_id':S,'session_id':S,'instance_id':S,'operation':{'type':'string','enum':['data_write','environment','other']},'task':S,'ownership':STRINGS,'acceptance':STRINGS},
+         {'request_id':PI_ID,'session_id':PI_ID,'instance_id':PI_ID,'operation':{'type':'string','enum':['data_write','environment','other']},'task':{'type':'string','minLength':1,'maxLength':4000},'ownership':CRITERIA,'acceptance':CRITERIA},
          ['request_id','session_id','instance_id','operation','task','ownership','acceptance']),
+    tool('pi_control','Steer or follow up with the exact existing active assignment owner, preserving its task and contract. Creates no task. Reuse control_id on retry; uncertain delivery requires reconciliation and is never replayed.',
+         {'request_id':PI_ID,'control_id':PI_ID,'action':{'type':'string','enum':['steer','follow_up']},
+          'message':{'type':'string','minLength':1,'maxLength':4000}},['request_id','control_id','action','message']),
     tool('pi_result','Read exact assignment delivery, Pi-reported result and Codex review. Completion requires review.',{'request_id':S},['request_id']),
     tool('pi_review','Record Codex acceptance after inspecting verification evidence for delegated Pi work.',
          {'request_id':S,'accepted':{'type':'boolean'},'evidence':STRINGS},['request_id','accepted','evidence']),
@@ -77,6 +83,8 @@ def call(root, name, args):
         return pi_router.context(args['session_id'])
     if name == 'pi_dispatch':
         return pi_router.dispatch(root/'swarm', args)
+    if name == 'pi_control':
+        return pi_router.control(root/'swarm', args)
     if name == 'pi_result':
         return pi_router.result(root/'swarm', args['request_id'])
     if name == 'pi_review':
